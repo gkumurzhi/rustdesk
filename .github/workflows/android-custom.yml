@@ -12,28 +12,47 @@
 #   ANDROID_KEY_PASSWORD        key password (same as keystore password for PKCS12)
 # Without ANDROID_SIGNING_KEY the APK is uploaded signed with the runner's debug key.
 #
+# Manual / API runs (workflow_dispatch) take three inputs: version (an upstream tag),
+# application_id and apk_basename. Sources are always checked out from rustdesk/rustdesk
+# at that tag; this fork only supplies the workflow and the signing secrets.
+#
 # NOTE: never push tags to this fork - upstream flutter-tag.yml / fdroid.yml run on tag push.
 
 name: Build custom Android APK
+# Shown in the runs list; the Deskport Factory app displays it as the build title.
+run-name: "${{ github.event.inputs.application_id || 'net.quillfern.deskport' }} @ ${{ github.event.inputs.version || '1.5.1' }}"
 
 on:
   push:
     branches:
       - android-custom
   workflow_dispatch:
+    inputs:
+      version:
+        description: "RustDesk version tag to build (e.g. 1.5.1)"
+        default: "1.5.1"
+      application_id:
+        description: "Custom package name (applicationId)"
+        default: "net.quillfern.deskport"
+      apk_basename:
+        description: "APK file base name"
+        default: "deskport"
 
 permissions:
   contents: read
 
 concurrency:
-  group: android-custom-${{ github.ref }}
+  # One build per (version, package): a re-run of the same pair replaces the older one,
+  # different pairs build side by side.
+  group: android-custom-${{ github.ref }}-${{ github.event.inputs.version || 'default' }}-${{ github.event.inputs.application_id || 'default' }}
   cancel-in-progress: true
 
 env:
-  # Must match applicationId in flutter/android/app/build.gradle
-  APP_ID: "net.quillfern.deskport"
-  APK_BASENAME: "deskport"
-  VERSION: "1.5.1"
+  # Defaults are used by the push trigger; workflow_dispatch overrides them via inputs.
+  # applicationId in build.gradle is overwritten with APP_ID at build time (see "Set applicationId").
+  APP_ID: ${{ github.event.inputs.application_id || 'net.quillfern.deskport' }}
+  APK_BASENAME: ${{ github.event.inputs.apk_basename || 'deskport' }}
+  VERSION: ${{ github.event.inputs.version || '1.5.1' }}
   RUST_VERSION: "1.75" # https://github.com/rustdesk/rustdesk/discussions/7503
   CARGO_NDK_VERSION: "3.1.2"
   CARGO_EXPAND_VERSION: "1.0.95"
@@ -53,6 +72,8 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          repository: rustdesk/rustdesk
+          ref: ${{ env.VERSION }}
           submodules: recursive
 
       - name: Install prerequisites
@@ -146,7 +167,7 @@ jobs:
           # - { arch: x86_64, target: x86_64-linux-android, abi: x86_64,
           #     flutter-platform: android-x64, ndk-script: ndk_x64.sh, libcxx-dir: x86_64-linux-android }
     env:
-      APK_NAME: ${{ github.workspace }}/signed-apk/deskport-1.5.1-${{ matrix.job.arch }}.apk
+      APK_NAME: ${{ github.workspace }}/signed-apk/${{ github.event.inputs.apk_basename || 'deskport' }}-${{ github.event.inputs.version || '1.5.1' }}-${{ matrix.job.arch }}.apk
     steps:
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
@@ -203,13 +224,39 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          repository: rustdesk/rustdesk
+          ref: ${{ env.VERSION }}
           submodules: recursive
 
-      - name: Check applicationId in build.gradle
+      - name: Use the tool versions pinned by this RustDesk version
         shell: bash
         run: |
+          # Upstream bumps NDK / vcpkg / Flutter between releases. Take them from the checked-out
+          # tag's own flutter-build.yml; the values in this workflow's env stay as the fallback.
+          F=.github/workflows/flutter-build.yml
+          for key in RUST_VERSION CARGO_NDK_VERSION ANDROID_FLUTTER_VERSION NDK_VERSION VCPKG_COMMIT_ID; do
+            val="$(sed -nE "/^  ${key}: /{s/^  ${key}: *\"([^\"]+)\".*/\1/p;q}" "$F" 2>/dev/null || true)"
+            if [[ -n "$val" ]]; then
+              echo "${key}=${val}" >> "$GITHUB_ENV"
+              echo "${key}=${val} (from ${F})"
+            else
+              echo "${key}=${!key} (fallback: not found in ${F})"
+            fi
+          done
+
+      - name: Set applicationId in build.gradle
+        shell: bash
+        run: |
+          # Fail in the first minutes instead of after the whole native build.
+          if [[ ! "$APP_ID" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
+            echo "::error::invalid application_id '${APP_ID}'"; exit 1
+          fi
+          if [[ ! "$APK_BASENAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::invalid apk_basename '${APK_BASENAME}'"; exit 1
+          fi
+          sed -i "s|applicationId \"[^\"]*\"|applicationId \"${APP_ID}\"|" flutter/android/app/build.gradle
           grep -q "applicationId \"${APP_ID}\"" flutter/android/app/build.gradle \
-            || { echo "::error::applicationId in build.gradle does not match APP_ID=${APP_ID}"; exit 1; }
+            || { echo "::error::failed to set applicationId=${APP_ID} in build.gradle"; exit 1; }
 
       - name: Install flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
@@ -221,8 +268,9 @@ jobs:
         shell: bash
         run: |
           cd $(dirname $(dirname $(which flutter)))
-          if [[ "3.24.5" == ${{ env.ANDROID_FLUTTER_VERSION }} ]]; then
-            git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+          PATCH=${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+          if [[ "3.24.5" == "${{ env.ANDROID_FLUTTER_VERSION }}" && -f "$PATCH" ]]; then
+            git apply "$PATCH"
           fi
 
       - uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
@@ -345,7 +393,7 @@ jobs:
         if: env.ANDROID_SIGNING_KEY != null
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: deskport-${{ env.VERSION }}-${{ matrix.job.arch }}-signed
+          name: ${{ env.APK_BASENAME }}-${{ env.VERSION }}-${{ matrix.job.arch }}-signed
           path: ${{ steps.sign-rustdesk.outputs.signedReleaseFile }}
           retention-days: 30
 
@@ -353,6 +401,6 @@ jobs:
         if: env.ANDROID_SIGNING_KEY == null
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: deskport-${{ env.VERSION }}-${{ matrix.job.arch }}-debugsigned
+          name: ${{ env.APK_BASENAME }}-${{ env.VERSION }}-${{ matrix.job.arch }}-debugsigned
           path: ${{ env.APK_NAME }}
           retention-days: 30
