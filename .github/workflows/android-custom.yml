@@ -62,19 +62,35 @@ env:
   NDK_VERSION: "r28c"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
-  ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
 
 jobs:
   generate-bridge:
     name: generate flutter-rust-bridge
     runs-on: ubuntu-22.04
     steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          # Fail in seconds instead of after the whole native build. The version must be an
+          # upstream release tag: the build runs that tag's scripts, so nothing else is trusted.
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+            echo "::error::invalid version '${VERSION}' (expected a release tag like 1.5.3)"; exit 1
+          fi
+          if [[ ! "$APP_ID" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
+            echo "::error::invalid application_id '${APP_ID}'"; exit 1
+          fi
+          if [[ ! "$APK_BASENAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::invalid apk_basename '${APK_BASENAME}'"; exit 1
+          fi
+
       - name: Checkout source code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: rustdesk/rustdesk
-          ref: ${{ env.VERSION }}
+          # Tags only: a bare name could also resolve to a branch or to any commit of the fork network.
+          ref: refs/tags/${{ env.VERSION }}
           submodules: recursive
+          persist-credentials: false
 
       - name: Install prerequisites
         run: |
@@ -225,8 +241,10 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: rustdesk/rustdesk
-          ref: ${{ env.VERSION }}
+          # Tags only: a bare name could also resolve to a branch or to any commit of the fork network.
+          ref: refs/tags/${{ env.VERSION }}
           submodules: recursive
+          persist-credentials: false
 
       - name: Use the tool versions pinned by this RustDesk version
         shell: bash
@@ -247,13 +265,6 @@ jobs:
       - name: Set applicationId in build.gradle
         shell: bash
         run: |
-          # Fail in the first minutes instead of after the whole native build.
-          if [[ ! "$APP_ID" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
-            echo "::error::invalid application_id '${APP_ID}'"; exit 1
-          fi
-          if [[ ! "$APK_BASENAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
-            echo "::error::invalid apk_basename '${APK_BASENAME}'"; exit 1
-          fi
           sed -i "s|applicationId \"[^\"]*\"|applicationId \"${APP_ID}\"|" flutter/android/app/build.gradle
           grep -q "applicationId \"${APP_ID}\"" flutter/android/app/build.gradle \
             || { echo "::error::failed to set applicationId=${APP_ID} in build.gradle"; exit 1; }
@@ -375,9 +386,57 @@ jobs:
             || { echo "::error::lib/${ABI}/librustdesk.so is missing from the APK"; exit 1; }
           echo "OK: package=${PKG}, lib/${ABI}/librustdesk.so present"
 
+      - name: Upload debug-signed APK
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.APK_BASENAME }}-${{ env.VERSION }}-${{ matrix.job.arch }}-debugsigned
+          path: ${{ env.APK_NAME }}
+          retention-days: 30
+
+  # Signing has its own job: the release key must never be in the environment of the job that
+  # executes the upstream build scripts and their dependencies. A signing problem can also be
+  # fixed and this job re-run alone, without rebuilding.
+  sign-apk:
+    needs: [build-android]
+    name: sign apk ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64] # keep in sync with the build-android matrix
+    steps:
+      - name: Check signing secrets
+        id: signing
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+        run: |
+          if [[ -n "$SIGNING_KEY" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No ANDROID_SIGNING_KEY secret: the APK stays signed with the runner's debug key"
+          fi
+
+      - name: Download debug-signed APK
+        if: steps.signing.outputs.available == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.APK_BASENAME }}-${{ env.VERSION }}-${{ matrix.arch }}-debugsigned
+          path: ./signed-apk
+
+      # https://github.com/r0adkll/sign-android-release/issues/84#issuecomment-1889636075
+      - name: Setup build-tools version variable
+        if: steps.signing.outputs.available == 'true'
+        shell: bash
+        run: |
+          BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n 1)
+          echo "ANDROID_SIGN_TOOL_VERSION=$BUILD_TOOL_VERSION" >> $GITHUB_ENV
+          echo Last build tool version is: $BUILD_TOOL_VERSION
+
       - uses: r0adkll/sign-android-release@349ebdef58775b1e0d8099458af0816dc79b6407 # v1
         name: Sign app APK
-        if: env.ANDROID_SIGNING_KEY != null
+        if: steps.signing.outputs.available == 'true'
         id: sign-rustdesk
         with:
           releaseDirectory: ./signed-apk
@@ -389,18 +448,19 @@ jobs:
           # env.ANDROID_SIGN_TOOL_VERSION is set by step "Setup build-tools version variable"
           BUILD_TOOLS_VERSION: ${{ env.ANDROID_SIGN_TOOL_VERSION }}
 
-      - name: Upload signed APK
-        if: env.ANDROID_SIGNING_KEY != null
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ env.APK_BASENAME }}-${{ env.VERSION }}-${{ matrix.job.arch }}-signed
-          path: ${{ steps.sign-rustdesk.outputs.signedReleaseFile }}
-          retention-days: 30
+      - name: Show the signing certificate
+        if: steps.signing.outputs.available == 'true'
+        shell: bash
+        env:
+          SIGNED_APK: ${{ steps.sign-rustdesk.outputs.signedReleaseFile }}
+        run: |
+          "/usr/local/lib/android/sdk/build-tools/${ANDROID_SIGN_TOOL_VERSION}/apksigner" verify --print-certs "$SIGNED_APK" \
+            | grep -E "^Signer #1 certificate (DN|SHA-256 digest):"
 
-      - name: Upload debug-signed APK
-        if: env.ANDROID_SIGNING_KEY == null
+      - name: Upload signed APK
+        if: steps.signing.outputs.available == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ env.APK_BASENAME }}-${{ env.VERSION }}-${{ matrix.job.arch }}-debugsigned
-          path: ${{ env.APK_NAME }}
+          name: ${{ env.APK_BASENAME }}-${{ env.VERSION }}-${{ matrix.arch }}-signed
+          path: ${{ steps.sign-rustdesk.outputs.signedReleaseFile }}
           retention-days: 30
