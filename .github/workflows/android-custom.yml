@@ -19,7 +19,7 @@
 # NOTE: never push tags to this fork - upstream flutter-tag.yml / fdroid.yml run on tag push.
 
 name: Build custom Android APK
-# Shown in the runs list; the Deskport Factory app displays it as the build title.
+# The Deskport Factory app finds the run it started by this exact title (Config.runTitle) and shows it.
 run-name: "${{ github.event.inputs.application_id || 'net.quillfern.deskport' }} @ ${{ github.event.inputs.version || '1.5.1' }}"
 
 on:
