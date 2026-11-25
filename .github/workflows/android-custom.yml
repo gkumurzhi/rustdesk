@@ -454,8 +454,11 @@ jobs:
         env:
           SIGNED_APK: ${{ steps.sign-rustdesk.outputs.signedReleaseFile }}
         run: |
-          "/usr/local/lib/android/sdk/build-tools/${ANDROID_SIGN_TOOL_VERSION}/apksigner" verify --print-certs "$SIGNED_APK" \
-            | grep -E "^Signer #1 certificate (DN|SHA-256 digest):"
+          if ! OUT="$("/usr/local/lib/android/sdk/build-tools/${ANDROID_SIGN_TOOL_VERSION}/apksigner" verify -v --print-certs "$SIGNED_APK" 2>&1)"; then
+            printf '%s\n' "$OUT"
+            exit 1
+          fi
+          awk '!/^WARNING: / { if (++n <= 40) print }' <<< "$OUT"
 
       - name: Upload signed APK
         if: steps.signing.outputs.available == 'true'
